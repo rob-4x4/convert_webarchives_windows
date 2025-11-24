@@ -9,18 +9,19 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Tuple, List
 
 try:
     from webarchive import WebArchive
 except Exception:
-    WebArchive = None  # handled later with clear error message
+    WebArchive = None
 
 try:
     from tqdm import tqdm
 except Exception:
-    tqdm = None  # handled later if user requests progress bar
+    tqdm = None
 
 # ========== DEFAULT CONFIG ==========
 DEFAULT_SRC = Path(r"D:\usbwork")
@@ -33,10 +34,11 @@ MAX_STEM_LEN = 200
 USE_LONG_PATH_PREFIX = True
 INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 RESERVED_NAMES = {
-    "CON","PRN","AUX","NUL",
-    *(f"COM{i}" for i in range(1,10)),
-    *(f"LPT{i}" for i in range(1,10))
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10))
 }
+MIN_WEBARCHIVE_SIZE = 512  # heuristic minimum bytes to consider
 # ============================
 
 def safe_component(name: str, max_len: int = MAX_COMPONENT_LEN) -> str:
@@ -68,7 +70,7 @@ def ensure_parent(path: Path, dry_run: bool = False):
     path.parent.mkdir(parents=True, exist_ok=True)
 
 def add_long_path_prefix(path_input: str) -> str:
-    """
+    r"""
     Return a normalized absolute path string.
     On Windows, optionally add the \\?\ prefix (and \\?\UNC\ for UNC paths) to support long paths.
     On non-Windows, return the absolute normalized path.
@@ -128,6 +130,53 @@ def truncate_rel_parts(rel: Path) -> Path:
         parts.append(safe_component(part, MAX_COMPONENT_LEN))
     return Path(*parts) if parts else Path("")
 
+# ---------- Validation helpers ----------
+
+def is_likely_webarchive_file(path: Path, min_size: int = MIN_WEBARCHIVE_SIZE) -> bool:
+    """Fast heuristic: extension, existence, minimum size, and markers in first chunk."""
+    if not path.is_file():
+        return False
+    if path.suffix.lower() != ".webarchive":
+        return False
+    try:
+        size = path.stat().st_size
+    except Exception:
+        return False
+    if size < min_size:
+        return False
+    try:
+        with path.open("rb") as fh:
+            chunk = fh.read(4096)
+    except Exception:
+        return False
+    markers = [b'<?xml', b'plist', b'AppleWebArchive', b'WebResource', b'WebMainResource']
+    return any(m in chunk for m in markers)
+
+def is_valid_webarchive_by_parsing(path: Path, dry_run: bool = False) -> Tuple[bool, str]:
+    """
+    Definitive parsing validation using pywebarchive.
+    Returns (True, "") on success or (False, "error") on failure.
+    """
+    if WebArchive is None:
+        return False, "pywebarchive not installed"
+    if dry_run:
+        # In dry-run mode, we skip heavy parsing but still report that parsing would be attempted.
+        return True, "dry-run: parsing skipped"
+    try:
+        wa = WebArchive(add_long_path_prefix(str(path)))
+    except Exception as e:
+        return False, f"pywebarchive init failed: {e}"
+    # Try writing to a temporary file to ensure the archive is parseable
+    try:
+        with tempfile.NamedTemporaryFile(prefix="wa_check_", suffix=".html", delete=True) as tf:
+            tmp_out = tf.name
+            wa.to_html_file(add_long_path_prefix(tmp_out))
+    except Exception as e:
+        return False, f"pywebarchive failed to produce HTML: {e}"
+    return True, ""
+
+# ---------- File discovery and processing ----------
+
 def gather_webarchive_files(src_root: Path) -> List[Path]:
     files: List[Path] = []
     for root, dirs, filenames in os.walk(src_root):
@@ -138,10 +187,18 @@ def gather_webarchive_files(src_root: Path) -> List[Path]:
 
 def process_single_file(src_file: Path, out_html_root: Path, out_pdf_root: Path,
                         failed_root: Path, wkhtml_path: Path,
-                        skip_pdf: bool, dry_run: bool) -> Tuple[bool, str]:
+                        skip_pdf: bool, dry_run: bool, validate: bool) -> Tuple[bool, str]:
     try:
         if not src_file.exists():
             return False, "source file not found"
+        # quick heuristic
+        if not is_likely_webarchive_file(src_file):
+            return False, "heuristic validation failed"
+        # optional parsing validation
+        if validate:
+            valid, msg = is_valid_webarchive_by_parsing(src_file, dry_run=dry_run)
+            if not valid:
+                return False, f"parsing validation failed: {msg}"
         rel_root = Path(".")
         safe_stem, _ = safe_stem_with_ext(src_file.name)
         out_html = out_html_root / rel_root / (safe_stem + ".html")
@@ -155,14 +212,14 @@ def process_single_file(src_file: Path, out_html_root: Path, out_pdf_root: Path,
         return True, "OK"
     except Exception as e:
         try:
-            move_failed(src_file, failed_root, rel_root, dry_run=dry_run)
+            move_failed(src_file, failed_root, Path("."), dry_run=dry_run)
+            return False, f"Conversion error: {e}; moved to failed"
         except Exception as me:
-            return False, f"Conversion error: {e}; Additionally failed to move: {me}"
-        return False, f"Conversion error: {e}"
+            return False, f"Conversion error: {e}; additionally failed to move: {me}"
 
 def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
                      failed_root: Path, wkhtml_path: Path,
-                     skip_pdf: bool, dry_run: bool, use_progress: bool):
+                     skip_pdf: bool, dry_run: bool, use_progress: bool, validate: bool):
     if not src_root.exists():
         print("Source folder not found:", src_root)
         return
@@ -192,7 +249,6 @@ def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
 
     for src_file in iterator:
         count += 1
-        # compute relative root truncation relative to src_root
         try:
             rel_root = src_file.parent.relative_to(src_root)
         except Exception:
@@ -208,6 +264,29 @@ def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
                 print(f"[{count}/{total}] Converting: {src_file}")
             else:
                 print(f"[{count}/{total}] (dry-run) Would convert: {src_file}")
+            # heuristic validation
+            if not is_likely_webarchive_file(src_file):
+                print(f"    Skipping (heuristic): {src_file}")
+                errors.append((str(src_file), "heuristic validation failed"))
+                try:
+                    move_failed(src_file, failed_root, rel_root_trunc, dry_run=dry_run)
+                    print(f"    Moved heuristic-failed .webarchive to {failed_root / rel_root_trunc}")
+                except Exception as me:
+                    print(f"    Failed to move heuristic-failed file {src_file}: {me}")
+                continue
+            # optional parsing validation
+            if validate:
+                valid, msg = is_valid_webarchive_by_parsing(src_file, dry_run=dry_run)
+                if not valid:
+                    print(f"    Parsing validation failed for {src_file}: {msg}")
+                    errors.append((str(src_file), f"parsing validation failed: {msg}"))
+                    try:
+                        move_failed(src_file, failed_root, rel_root_trunc, dry_run=dry_run)
+                        print(f"    Moved invalid .webarchive to {failed_root / rel_root_trunc}")
+                    except Exception as me:
+                        print(f"    Failed to move invalid file {src_file}: {me}")
+                    continue
+
             convert_to_html(src_file, out_html, dry_run=dry_run)
             if not dry_run:
                 print(f"    HTML -> {out_html}")
@@ -237,6 +316,8 @@ def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
     else:
         print("No errors encountered.")
 
+# ---------- CLI ----------
+
 def parse_args():
     p = argparse.ArgumentParser(description="Convert .webarchive files to HTML (and PDF via wkhtmltopdf)")
     p.add_argument("--src", type=Path, default=DEFAULT_SRC, help="Source folder to scan")
@@ -247,12 +328,12 @@ def parse_args():
     p.add_argument("--skip-pdf", action="store_true", help="Skip PDF conversion")
     p.add_argument("--dry-run", action="store_true", help="Do not write files; print what would be done")
     p.add_argument("--test-file", type=Path, help="Test single .webarchive file and exit")
-    p.add_argument("--no-progress", action="store_true", help="Disable progress bar (useful if tqdm not installed)")
+    p.add_argument("--no-progress", action="store_true", help="Disable progress bar")
+    p.add_argument("--validate", action="store_true", help="Enable parsing validation with pywebarchive (slower)")
     return p.parse_args()
 
 def main():
     args = parse_args()
-
     use_progress = not args.no_progress
 
     if args.test_file:
@@ -264,7 +345,8 @@ def main():
             failed_root=args.failed,
             wkhtml_path=args.wkhtml,
             skip_pdf=args.skip_pdf,
-            dry_run=args.dry_run
+            dry_run=args.dry_run,
+            validate=args.validate
         )
         if success:
             print("Test conversion succeeded:", message)
@@ -282,7 +364,8 @@ def main():
             wkhtml_path=args.wkhtml,
             skip_pdf=args.skip_pdf,
             dry_run=args.dry_run,
-            use_progress=use_progress
+            use_progress=use_progress,
+            validate=args.validate
         )
         return 0
     except Exception as e:
