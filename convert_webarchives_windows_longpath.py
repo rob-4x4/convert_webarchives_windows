@@ -38,8 +38,9 @@ RESERVED_NAMES = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10))
 }
-MIN_WEBARCHIVE_SIZE = 128  # heuristic minimum bytes to consider (tune if needed)
+MIN_WEBARCHIVE_SIZE = 128
 # ============================
+
 
 def safe_component(name: str, max_len: int = MAX_COMPONENT_LEN) -> str:
     name = INVALID_CHARS_RE.sub("_", name)
@@ -51,6 +52,7 @@ def safe_component(name: str, max_len: int = MAX_COMPONENT_LEN) -> str:
     if len(name) > max_len:
         name = name[:max_len]
     return name
+
 
 def safe_stem_with_ext(orig_name: str, stem_max: int = MAX_STEM_LEN) -> Tuple[str, str]:
     stem, ext = os.path.splitext(orig_name)
@@ -64,16 +66,17 @@ def safe_stem_with_ext(orig_name: str, stem_max: int = MAX_STEM_LEN) -> Tuple[st
     ext = ext if ext else ""
     return stem, ext
 
+
 def ensure_parent(path: Path, dry_run: bool = False):
     if dry_run:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
 
+
 def add_long_path_prefix(path_input: str) -> str:
     r"""
     Return a normalized absolute path string.
     On Windows, optionally add the \\?\ prefix (and \\?\UNC\ for UNC paths) to support long paths.
-    On non-Windows, return the absolute normalized path.
     """
     p = str(path_input)
     p = os.path.abspath(p)
@@ -85,16 +88,194 @@ def add_long_path_prefix(path_input: str) -> str:
         return '\\\\?\\UNC\\' + p.lstrip('\\')
     return '\\\\?\\' + p
 
+
+def _write_text_file(path: str, text: str):
+    # write text to file path (path may be long-path-prefixed string)
+    with open(path, "w", encoding="utf-8", errors="replace") as fh:
+        fh.write(text)
+
+
+# ----------------- Helpers to build index / extract resources ----------------- #
+def _build_index_from_wa(wa, src_name: str) -> str:
+    parts = [
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8'>",
+        f"<title>Index of {src_name}</title>",
+        "</head><body>",
+        f"<h1>Index of resources in {src_name}</h1>",
+        "<ul>"
+    ]
+
+    try:
+        mr = getattr(wa, "main_resource", None) or getattr(wa, "_main_resource", None)
+        if mr:
+            name = getattr(mr, "url", None) or getattr(mr, "URL", None) or getattr(mr, "filename", None) or "main"
+            mime = getattr(mr, "mimeType", None) or getattr(mr, "MIMEType", None) or None
+            parts.append(f"<li>Main resource: {name} (mime={mime})</li>")
+    except Exception:
+        pass
+
+    try:
+        subs = None
+        for attr in ("subresources", "_subresources", "subframe_archives", "subframe"):
+            if hasattr(wa, attr):
+                try:
+                    col = getattr(wa, attr)
+                    if col:
+                        subs = list(col) if isinstance(col, (list, tuple)) else list(col)
+                        break
+                except Exception:
+                    continue
+        if subs:
+            for i, r in enumerate(subs, start=1):
+                rname = getattr(r, "url", None) or getattr(r, "URL", None) or getattr(r, "filename", None) or f"resource_{i}"
+                rmime = getattr(r, "mimeType", None) or getattr(r, "MIMEType", None) or None
+                parts.append(f"<li>Resource: {rname} (mime={rmime})</li>")
+    except Exception:
+        pass
+
+    parts.append("</ul></body></html>")
+    return "\n".join(parts)
+
+
+def _guess_html_resource_from_wa(wa) -> Tuple[str, str]:
+    candidates = []
+    for attr in ("web_main_resource", "main_resource", "mainResource", "WebMainResource", "_main_resource"):
+        if hasattr(wa, attr):
+            mr = getattr(wa, attr)
+            if mr:
+                candidates.append(mr)
+    for attr in ("resources", "web_resources", "WebResources", "resourcesList", "subresources", "_subresources"):
+        if hasattr(wa, attr):
+            rcol = getattr(wa, attr)
+            if rcol:
+                try:
+                    if isinstance(rcol, (list, tuple)):
+                        for r in rcol:
+                            candidates.append(r)
+                    else:
+                        for r in rcol:
+                            candidates.append(r)
+                except Exception:
+                    pass
+
+    def inspect_resource_obj(obj):
+        mime = None
+        data = None
+        for mname in ("mimeType", "MIMEType", "mime", "contentType"):
+            if hasattr(obj, mname):
+                try:
+                    mime = getattr(obj, mname)
+                    break
+                except Exception:
+                    pass
+        for dname in ("data", "data_bytes", "content", "html", "value"):
+            if hasattr(obj, dname):
+                try:
+                    data = getattr(obj, dname)
+                    break
+                except Exception:
+                    pass
+        if mime is None and isinstance(obj, dict):
+            for key in ("mimeType", "MIMEType", "mime", "contentType"):
+                if key in obj:
+                    mime = obj.get(key)
+                    break
+        if data is None and isinstance(obj, dict):
+            for key in ("data", "content", "html", "value"):
+                if key in obj:
+                    data = obj.get(key)
+                    break
+        if data is not None and isinstance(data, (bytes, bytearray)):
+            try:
+                text = data.decode("utf-8")
+            except Exception:
+                try:
+                    text = data.decode("latin-1")
+                except Exception:
+                    text = None
+            data = text
+        return mime, data
+
+    for res in candidates:
+        try:
+            mime, text = inspect_resource_obj(res)
+            if mime and isinstance(mime, str) and "html" in mime.lower() and text:
+                return mime, text
+            if isinstance(res, str) and "<html" in res.lower():
+                return "text/html", res
+        except Exception:
+            continue
+    return None, None
+
+
+# ----------------- Conversion using pywebarchive 0.5.2 APIs ----------------- #
 def convert_to_html(src_path: Path, html_dest: Path, dry_run: bool = False):
+    """
+    Uses WebArchive.to_html() when available; falls back to extracting main_resource
+    or building an index if no main resource is present.
+    """
     ensure_parent(html_dest, dry_run=dry_run)
     if dry_run:
         return
     if WebArchive is None:
-        raise RuntimeError("pywebarchive not available. Please pip install pywebarchive")
+        raise RuntimeError("pywebarchive not installed; pip install pywebarchive")
+
     web_src = add_long_path_prefix(str(src_path))
     web_out = add_long_path_prefix(str(html_dest))
+
     wa = WebArchive(web_src)
-    wa.to_html_file(web_out)
+
+    last_exc = None
+    if hasattr(wa, "to_html"):
+        try:
+            html_text = wa.to_html()
+            if html_text:
+                _write_text_file(web_out, html_text)
+                return
+        except Exception as e:
+            last_exc = e
+
+    try:
+        mime, html_text = _guess_html_resource_from_wa(wa)
+        if mime and html_text:
+            _write_text_file(web_out, html_text)
+            return
+    except Exception as e:
+        last_exc = e
+
+    try:
+        mr = getattr(wa, "main_resource", None) or getattr(wa, "_main_resource", None)
+        if mr:
+            data = None
+            for key in ("data", "data_bytes", "content", "html"):
+                if hasattr(mr, key):
+                    try:
+                        data = getattr(mr, key)
+                        break
+                    except Exception:
+                        continue
+            if isinstance(data, (bytes, bytearray)):
+                try:
+                    text = data.decode("utf-8")
+                except Exception:
+                    try:
+                        text = data.decode("latin-1")
+                    except Exception:
+                        text = None
+                if text:
+                    _write_text_file(web_out, text)
+                    return
+            if isinstance(data, str):
+                _write_text_file(web_out, data)
+                return
+    except Exception:
+        pass
+
+    idx = _build_index_from_wa(wa, src_path.name)
+    _write_text_file(web_out, idx)
+    return
+
 
 def html_to_pdf(html_path: Path, pdf_dest: Path, wkhtml_path: Path, dry_run: bool = False):
     ensure_parent(pdf_dest, dry_run=dry_run)
@@ -106,6 +287,7 @@ def html_to_pdf(html_path: Path, pdf_dest: Path, wkhtml_path: Path, dry_run: boo
     html_arg = add_long_path_prefix(str(html_path))
     pdf_arg = add_long_path_prefix(str(pdf_dest))
     subprocess.run([wk, '--quiet', html_arg, pdf_arg], check=True)
+
 
 def move_failed(src_file: Path, failed_root: Path, rel_root: Path, dry_run: bool = False):
     dest = failed_root / rel_root / src_file.name
@@ -124,26 +306,19 @@ def move_failed(src_file: Path, failed_root: Path, rel_root: Path, dry_run: bool
         except Exception as e2:
             raise RuntimeError(f"Failed to move or copy failed file {src_file}: {e2}") from e2
 
+
 def truncate_rel_parts(rel: Path) -> Path:
     parts = []
     for part in rel.parts:
         parts.append(safe_component(part, MAX_COMPONENT_LEN))
     return Path(*parts) if parts else Path("")
 
+
 # ---------- Validation helpers ----------
 
 def is_likely_webarchive_file(path: Path, min_size: int = MIN_WEBARCHIVE_SIZE) -> bool:
-    """
-    Heuristic checks:
-    - Skip AppleDouble metadata files whose name begins with "._"
-    - Require .webarchive extension and existence
-    - Check minimum file size (tunable)
-    - Accept XML/plist text markers and binary plist marker bplist00
-    """
-    # Skip AppleDouble sidecar files produced on some Macs
     if path.name.startswith("._"):
         return False
-
     if not path.is_file():
         return False
     if path.suffix.lower() != ".webarchive":
@@ -159,36 +334,88 @@ def is_likely_webarchive_file(path: Path, min_size: int = MIN_WEBARCHIVE_SIZE) -
             chunk = fh.read(8192)
     except Exception:
         return False
-    markers = [
-        b'<?xml',
-        b'plist',
-        b'AppleWebArchive',
-        b'WebResource',
-        b'WebMainResource',
-        b'bplist00'
-    ]
+    markers = [b'<?xml', b'plist', b'AppleWebArchive', b'WebResource', b'WebMainResource', b'bplist00']
     return any(m in chunk for m in markers)
+
 
 def is_valid_webarchive_by_parsing(path: Path, dry_run: bool = False) -> Tuple[bool, str]:
     """
     Definitive parsing validation using pywebarchive.
-    Returns (True, "") on success or (False, "error") on failure.
+    Creates a temp file with mkstemp then closes descriptor so Windows won't block it.
     """
     if WebArchive is None:
         return False, "pywebarchive not installed"
     if dry_run:
         return True, "dry-run: parsing skipped"
+
     try:
         wa = WebArchive(add_long_path_prefix(str(path)))
     except Exception as e:
         return False, f"pywebarchive init failed: {e}"
+
+    fd = None
+    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(prefix="wa_check_", suffix=".html", delete=True) as tf:
-            tmp_out = tf.name
-            wa.to_html_file(add_long_path_prefix(tmp_out))
+        fd, tmp_path = tempfile.mkstemp(prefix="wa_check_", suffix=".html")
+        os.close(fd)
+        tmp_out = add_long_path_prefix(tmp_path)
+
+        try:
+            if hasattr(wa, "to_html"):
+                try:
+                    text = wa.to_html()
+                    if text:
+                        _write_text_file(tmp_out, text)
+                        return True, ""
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            mr = getattr(wa, "main_resource", None) or getattr(wa, "_main_resource", None)
+            if mr:
+                data = None
+                for key in ("data", "data_bytes", "content", "html"):
+                    if hasattr(mr, key):
+                        try:
+                            data = getattr(mr, key)
+                            break
+                        except Exception:
+                            continue
+                if isinstance(data, (bytes, bytearray)):
+                    try:
+                        text = data.decode("utf-8")
+                    except Exception:
+                        try:
+                            text = data.decode("latin-1")
+                        except Exception:
+                            text = None
+                    if text:
+                        _write_text_file(tmp_out, text)
+                        return True, ""
+                if isinstance(data, str):
+                    _write_text_file(tmp_out, data)
+                    return True, ""
+        except Exception:
+            pass
+
+        try:
+            idx = _build_index_from_wa(wa, path.name)
+            _write_text_file(tmp_out, idx)
+            return True, ""
+        except Exception as e:
+            return False, f"fallback index generation failed: {e}"
+
     except Exception as e:
-        return False, f"pywebarchive failed to produce HTML: {e}"
-    return True, ""
+        return False, f"temp file error: {e}"
+    finally:
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
 
 # ---------- File discovery and processing ----------
 
@@ -200,18 +427,14 @@ def gather_webarchive_files(src_root: Path) -> List[Path]:
                 files.append(Path(root) / fn)
     return files
 
+
 def clean_sidecars_to_failed(src_root: Path, failed_root: Path, dry_run: bool = False) -> int:
-    """
-    Find files starting with "._" under src_root and move them to failed_root,
-    preserving directory structure under failed_root. Returns count moved (or planned).
-    """
     moved = 0
     for root, dirs, filenames in os.walk(src_root):
         for fn in filenames:
             if fn.startswith("._") and fn.lower().endswith(".webarchive"):
                 src_file = Path(root) / fn
                 try:
-                    # compute relative directory to preserve structure
                     try:
                         rel = Path(root).relative_to(src_root)
                     except Exception:
@@ -221,6 +444,7 @@ def clean_sidecars_to_failed(src_root: Path, failed_root: Path, dry_run: bool = 
                 except Exception as e:
                     print(f"    Failed to move sidecar {src_file}: {e}")
     return moved
+
 
 def process_single_file(src_file: Path, out_html_root: Path, out_pdf_root: Path,
                         failed_root: Path, wkhtml_path: Path,
@@ -251,6 +475,7 @@ def process_single_file(src_file: Path, out_html_root: Path, out_pdf_root: Path,
             return False, f"Conversion error: {e}; moved to failed"
         except Exception as me:
             return False, f"Conversion error: {e}; additionally failed to move: {me}"
+
 
 def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
                      failed_root: Path, wkhtml_path: Path,
@@ -305,7 +530,6 @@ def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
                 print(f"[{count}/{total}] Converting: {src_file}")
             else:
                 print(f"[{count}/{total}] (dry-run) Would convert: {src_file}")
-            # heuristic validation
             if not is_likely_webarchive_file(src_file):
                 print(f"    Skipping (heuristic): {src_file}")
                 errors.append((str(src_file), "heuristic validation failed"))
@@ -315,7 +539,6 @@ def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
                 except Exception as me:
                     print(f"    Failed to move heuristic-failed file {src_file}: {me}")
                 continue
-            # optional parsing validation
             if validate:
                 valid, msg = is_valid_webarchive_by_parsing(src_file, dry_run=dry_run)
                 if not valid:
@@ -357,6 +580,7 @@ def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
     else:
         print("No errors encountered.")
 
+
 # ---------- CLI ----------
 
 def parse_args():
@@ -373,6 +597,7 @@ def parse_args():
     p.add_argument("--validate", action="store_true", help="Enable parsing validation with pywebarchive (slower)")
     p.add_argument("--clean-sidecars", action="store_true", help="Move AppleDouble sidecar files (._*.webarchive) to FAILED before processing")
     return p.parse_args()
+
 
 def main():
     args = parse_args()
@@ -414,6 +639,7 @@ def main():
     except Exception as e:
         print("Fatal error:", e)
         return 1
+
 
 if __name__ == "__main__":
     if os.name != 'nt':
