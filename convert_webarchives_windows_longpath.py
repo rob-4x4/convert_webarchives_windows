@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # convert_webarchives_windows_longpath.py
-# Requirements: pip install pywebarchive
+# Requirements: pip install pywebarchive tqdm
 # Optional: install wkhtmltopdf for PDF output
 
 import argparse
@@ -10,12 +10,17 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List
 
 try:
     from webarchive import WebArchive
-except Exception as e:
-    WebArchive = None  # handled later with clearer error message
+except Exception:
+    WebArchive = None  # handled later with clear error message
+
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None  # handled later if user requests progress bar
 
 # ========== DEFAULT CONFIG ==========
 DEFAULT_SRC = Path(r"D:\usbwork")
@@ -72,10 +77,8 @@ def add_long_path_prefix(path_input: str) -> str:
     p = os.path.abspath(p)
     if os.name != 'nt' or not USE_LONG_PATH_PREFIX:
         return p
-    # Already prefixed?
     if p.startswith('\\\\?\\'):
         return p
-    # UNC: \\server\share -> \\?\UNC\server\share
     if p.startswith('\\\\'):
         return '\\\\?\\UNC\\' + p.lstrip('\\')
     return '\\\\?\\' + p
@@ -88,7 +91,6 @@ def convert_to_html(src_path: Path, html_dest: Path, dry_run: bool = False):
         raise RuntimeError("pywebarchive not available. Please pip install pywebarchive")
     web_src = add_long_path_prefix(str(src_path))
     web_out = add_long_path_prefix(str(html_dest))
-    # WebArchive expects a path-like string; keep consistent with long-path usage
     wa = WebArchive(web_src)
     wa.to_html_file(web_out)
 
@@ -101,7 +103,6 @@ def html_to_pdf(html_path: Path, pdf_dest: Path, wkhtml_path: Path, dry_run: boo
         raise FileNotFoundError("wkhtmltopdf not configured or not found at: " + str(wkhtml_path))
     html_arg = add_long_path_prefix(str(html_path))
     pdf_arg = add_long_path_prefix(str(pdf_dest))
-    # Use subprocess with check=True to raise on errors
     subprocess.run([wk, '--quiet', html_arg, pdf_arg], check=True)
 
 def move_failed(src_file: Path, failed_root: Path, rel_root: Path, dry_run: bool = False):
@@ -127,12 +128,17 @@ def truncate_rel_parts(rel: Path) -> Path:
         parts.append(safe_component(part, MAX_COMPONENT_LEN))
     return Path(*parts) if parts else Path("")
 
+def gather_webarchive_files(src_root: Path) -> List[Path]:
+    files: List[Path] = []
+    for root, dirs, filenames in os.walk(src_root):
+        for fn in filenames:
+            if fn.lower().endswith('.webarchive'):
+                files.append(Path(root) / fn)
+    return files
+
 def process_single_file(src_file: Path, out_html_root: Path, out_pdf_root: Path,
                         failed_root: Path, wkhtml_path: Path,
                         skip_pdf: bool, dry_run: bool) -> Tuple[bool, str]:
-    """
-    Convert a single .webarchive file. Returns (success, message).
-    """
     try:
         if not src_file.exists():
             return False, "source file not found"
@@ -140,77 +146,90 @@ def process_single_file(src_file: Path, out_html_root: Path, out_pdf_root: Path,
         safe_stem, _ = safe_stem_with_ext(src_file.name)
         out_html = out_html_root / rel_root / (safe_stem + ".html")
         out_pdf = out_pdf_root / rel_root / (safe_stem + ".pdf")
-        print(f"Converting: {src_file}")
         convert_to_html(src_file, out_html, dry_run=dry_run)
-        print(f"    HTML -> {out_html}")
         if (not skip_pdf) and wkhtml_path:
             try:
                 html_to_pdf(out_html, out_pdf, wkhtml_path, dry_run=dry_run)
-                print(f"    PDF  -> {out_pdf}")
             except Exception as e:
                 return False, f"PDF conversion failed: {e}"
         return True, "OK"
     except Exception as e:
-        # Attempt to move failed file
         try:
             move_failed(src_file, failed_root, rel_root, dry_run=dry_run)
-            print(f"    Moved failed .webarchive to {failed_root / rel_root}")
         except Exception as me:
             return False, f"Conversion error: {e}; Additionally failed to move: {me}"
         return False, f"Conversion error: {e}"
 
 def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
                      failed_root: Path, wkhtml_path: Path,
-                     skip_pdf: bool, dry_run: bool):
+                     skip_pdf: bool, dry_run: bool, use_progress: bool):
     if not src_root.exists():
         print("Source folder not found:", src_root)
         return
+
     out_html_root.mkdir(parents=True, exist_ok=True)
     out_pdf_root.mkdir(parents=True, exist_ok=True)
     failed_root.mkdir(parents=True, exist_ok=True)
 
-    count = 0
-    errors = []
+    all_files = gather_webarchive_files(src_root)
+    total = len(all_files)
+    if total == 0:
+        print("No .webarchive files found under:", src_root)
+        return
 
-    for root, dirs, files in os.walk(src_root):
-        root_path = Path(root)
+    print(f"Found {total} .webarchive files. Starting conversion{' (dry-run)' if dry_run else ''}.")
+
+    iterator = all_files
+    if use_progress:
+        if tqdm is None:
+            print("tqdm not installed; install it with: pip install tqdm")
+            iterator = all_files
+        else:
+            iterator = tqdm(all_files, desc="Converting", unit="file", ncols=100)
+
+    errors = []
+    count = 0
+
+    for src_file in iterator:
+        count += 1
+        # compute relative root truncation relative to src_root
         try:
-            rel_root = root_path.relative_to(src_root)
+            rel_root = src_file.parent.relative_to(src_root)
         except Exception:
             rel_root = Path(".")
         rel_root_trunc = truncate_rel_parts(rel_root)
 
-        for fname in files:
-            if not fname.lower().endswith('.webarchive'):
-                continue
-            count += 1
-            src_file = root_path / fname
-            safe_stem, _ = safe_stem_with_ext(src_file.name)
-            out_html = out_html_root / rel_root_trunc / (safe_stem + ".html")
-            out_pdf = out_pdf_root / rel_root_trunc / (safe_stem + ".pdf")
+        safe_stem, _ = safe_stem_with_ext(src_file.name)
+        out_html = out_html_root / rel_root_trunc / (safe_stem + ".html")
+        out_pdf = out_pdf_root / rel_root_trunc / (safe_stem + ".pdf")
 
-            try:
-                print(f"[{count}] Converting: {src_file}")
-                convert_to_html(src_file, out_html, dry_run=dry_run)
+        try:
+            if not dry_run:
+                print(f"[{count}/{total}] Converting: {src_file}")
+            else:
+                print(f"[{count}/{total}] (dry-run) Would convert: {src_file}")
+            convert_to_html(src_file, out_html, dry_run=dry_run)
+            if not dry_run:
                 print(f"    HTML -> {out_html}")
-                if (not skip_pdf) and wkhtml_path:
-                    try:
-                        html_to_pdf(out_html, out_pdf, wkhtml_path, dry_run=dry_run)
-                        print(f"    PDF  -> {out_pdf}")
-                    except Exception as e:
-                        print(f"    PDF conversion failed for {out_html}: {e}")
-                        errors.append((str(src_file), f"PDF error: {e}"))
-            except Exception as e:
-                print(f"    ERROR converting {src_file}: {e}")
-                errors.append((str(src_file), str(e)))
+            if (not skip_pdf) and wkhtml_path:
                 try:
-                    move_failed(src_file, failed_root, rel_root_trunc, dry_run=dry_run)
-                    print(f"    Moved failed .webarchive to {failed_root / rel_root_trunc}")
-                except Exception as me:
-                    print(f"    Failed to move failed file {src_file}: {me}")
+                    html_to_pdf(out_html, out_pdf, wkhtml_path, dry_run=dry_run)
+                    if not dry_run:
+                        print(f"    PDF  -> {out_pdf}")
+                except Exception as e:
+                    print(f"    PDF conversion failed for {out_html}: {e}")
+                    errors.append((str(src_file), f"PDF error: {e}"))
+        except Exception as e:
+            print(f"    ERROR converting {src_file}: {e}")
+            errors.append((str(src_file), str(e)))
+            try:
+                move_failed(src_file, failed_root, rel_root_trunc, dry_run=dry_run)
+                print(f"    Moved failed .webarchive to {failed_root / rel_root_trunc}")
+            except Exception as me:
+                print(f"    Failed to move failed file {src_file}: {me}")
 
     print(f"\nDone. Scanned tree starting at: {src_root}")
-    print(f"Total .webarchive files found: {count}")
+    print(f"Total .webarchive files processed: {total}")
     if errors:
         print(f"Total items with errors: {len(errors)}")
         for fpath, err in errors:
@@ -228,13 +247,15 @@ def parse_args():
     p.add_argument("--skip-pdf", action="store_true", help="Skip PDF conversion")
     p.add_argument("--dry-run", action="store_true", help="Do not write files; print what would be done")
     p.add_argument("--test-file", type=Path, help="Test single .webarchive file and exit")
+    p.add_argument("--no-progress", action="store_true", help="Disable progress bar (useful if tqdm not installed)")
     return p.parse_args()
 
 def main():
     args = parse_args()
 
+    use_progress = not args.no_progress
+
     if args.test_file:
-        # Single-file test mode: convert the provided file only
         print("Running single-file test for:", args.test_file)
         success, message = process_single_file(
             src_file=args.test_file,
@@ -252,7 +273,6 @@ def main():
             print("Test conversion failed:", message)
             return 2
 
-    # Normal batch mode: walk the tree
     try:
         walk_and_process(
             src_root=args.src,
@@ -261,7 +281,8 @@ def main():
             failed_root=args.failed,
             wkhtml_path=args.wkhtml,
             skip_pdf=args.skip_pdf,
-            dry_run=args.dry_run
+            dry_run=args.dry_run,
+            use_progress=use_progress
         )
         return 0
     except Exception as e:
@@ -269,7 +290,6 @@ def main():
         return 1
 
 if __name__ == "__main__":
-    # Informative note when running on non-Windows
     if os.name != 'nt':
         print("Note: This script is written for Windows and uses Windows long-path prefixes when enabled.")
     sys.exit(main())
