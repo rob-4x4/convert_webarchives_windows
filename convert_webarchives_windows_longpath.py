@@ -38,7 +38,7 @@ RESERVED_NAMES = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10))
 }
-MIN_WEBARCHIVE_SIZE = 512  # heuristic minimum bytes to consider
+MIN_WEBARCHIVE_SIZE = 128  # heuristic minimum bytes to consider (tune if needed)
 # ============================
 
 def safe_component(name: str, max_len: int = MAX_COMPONENT_LEN) -> str:
@@ -133,7 +133,17 @@ def truncate_rel_parts(rel: Path) -> Path:
 # ---------- Validation helpers ----------
 
 def is_likely_webarchive_file(path: Path, min_size: int = MIN_WEBARCHIVE_SIZE) -> bool:
-    """Fast heuristic: extension, existence, minimum size, and markers in first chunk."""
+    """
+    Heuristic checks:
+    - Skip AppleDouble metadata files whose name begins with "._"
+    - Require .webarchive extension and existence
+    - Check minimum file size (tunable)
+    - Accept XML/plist text markers and binary plist marker bplist00
+    """
+    # Skip AppleDouble sidecar files produced on some Macs
+    if path.name.startswith("._"):
+        return False
+
     if not path.is_file():
         return False
     if path.suffix.lower() != ".webarchive":
@@ -146,10 +156,17 @@ def is_likely_webarchive_file(path: Path, min_size: int = MIN_WEBARCHIVE_SIZE) -
         return False
     try:
         with path.open("rb") as fh:
-            chunk = fh.read(4096)
+            chunk = fh.read(8192)
     except Exception:
         return False
-    markers = [b'<?xml', b'plist', b'AppleWebArchive', b'WebResource', b'WebMainResource']
+    markers = [
+        b'<?xml',
+        b'plist',
+        b'AppleWebArchive',
+        b'WebResource',
+        b'WebMainResource',
+        b'bplist00'
+    ]
     return any(m in chunk for m in markers)
 
 def is_valid_webarchive_by_parsing(path: Path, dry_run: bool = False) -> Tuple[bool, str]:
@@ -160,13 +177,11 @@ def is_valid_webarchive_by_parsing(path: Path, dry_run: bool = False) -> Tuple[b
     if WebArchive is None:
         return False, "pywebarchive not installed"
     if dry_run:
-        # In dry-run mode, we skip heavy parsing but still report that parsing would be attempted.
         return True, "dry-run: parsing skipped"
     try:
         wa = WebArchive(add_long_path_prefix(str(path)))
     except Exception as e:
         return False, f"pywebarchive init failed: {e}"
-    # Try writing to a temporary file to ensure the archive is parseable
     try:
         with tempfile.NamedTemporaryFile(prefix="wa_check_", suffix=".html", delete=True) as tf:
             tmp_out = tf.name
@@ -185,16 +200,36 @@ def gather_webarchive_files(src_root: Path) -> List[Path]:
                 files.append(Path(root) / fn)
     return files
 
+def clean_sidecars_to_failed(src_root: Path, failed_root: Path, dry_run: bool = False) -> int:
+    """
+    Find files starting with "._" under src_root and move them to failed_root,
+    preserving directory structure under failed_root. Returns count moved (or planned).
+    """
+    moved = 0
+    for root, dirs, filenames in os.walk(src_root):
+        for fn in filenames:
+            if fn.startswith("._") and fn.lower().endswith(".webarchive"):
+                src_file = Path(root) / fn
+                try:
+                    # compute relative directory to preserve structure
+                    try:
+                        rel = Path(root).relative_to(src_root)
+                    except Exception:
+                        rel = Path(".")
+                    move_failed(src_file, failed_root, rel, dry_run=dry_run)
+                    moved += 1
+                except Exception as e:
+                    print(f"    Failed to move sidecar {src_file}: {e}")
+    return moved
+
 def process_single_file(src_file: Path, out_html_root: Path, out_pdf_root: Path,
                         failed_root: Path, wkhtml_path: Path,
                         skip_pdf: bool, dry_run: bool, validate: bool) -> Tuple[bool, str]:
     try:
         if not src_file.exists():
             return False, "source file not found"
-        # quick heuristic
         if not is_likely_webarchive_file(src_file):
             return False, "heuristic validation failed"
-        # optional parsing validation
         if validate:
             valid, msg = is_valid_webarchive_by_parsing(src_file, dry_run=dry_run)
             if not valid:
@@ -219,7 +254,8 @@ def process_single_file(src_file: Path, out_html_root: Path, out_pdf_root: Path,
 
 def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
                      failed_root: Path, wkhtml_path: Path,
-                     skip_pdf: bool, dry_run: bool, use_progress: bool, validate: bool):
+                     skip_pdf: bool, dry_run: bool, use_progress: bool, validate: bool,
+                     clean_sidecars: bool):
     if not src_root.exists():
         print("Source folder not found:", src_root)
         return
@@ -227,6 +263,11 @@ def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
     out_html_root.mkdir(parents=True, exist_ok=True)
     out_pdf_root.mkdir(parents=True, exist_ok=True)
     failed_root.mkdir(parents=True, exist_ok=True)
+
+    if clean_sidecars:
+        print("Cleaning AppleDouble sidecar files (._*.webarchive) into failed folder...")
+        moved = clean_sidecars_to_failed(src_root, failed_root, dry_run=dry_run)
+        print(f"  Sidecars moved (or planned): {moved}")
 
     all_files = gather_webarchive_files(src_root)
     total = len(all_files)
@@ -330,6 +371,7 @@ def parse_args():
     p.add_argument("--test-file", type=Path, help="Test single .webarchive file and exit")
     p.add_argument("--no-progress", action="store_true", help="Disable progress bar")
     p.add_argument("--validate", action="store_true", help="Enable parsing validation with pywebarchive (slower)")
+    p.add_argument("--clean-sidecars", action="store_true", help="Move AppleDouble sidecar files (._*.webarchive) to FAILED before processing")
     return p.parse_args()
 
 def main():
@@ -365,7 +407,8 @@ def main():
             skip_pdf=args.skip_pdf,
             dry_run=args.dry_run,
             use_progress=use_progress,
-            validate=args.validate
+            validate=args.validate,
+            clean_sidecars=args.clean_sidecars
         )
         return 0
     except Exception as e:
