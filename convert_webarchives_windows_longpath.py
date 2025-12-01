@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # convert_webarchives_windows_longpath.py
-# Requirements: pip install pywebarchive tqdm
+# Requirements: pip install pywebarchive tqdm requests
 # Optional: install wkhtmltopdf for PDF output
 
 import argparse
@@ -16,6 +16,11 @@ from pathlib import Path, PurePath
 from typing import Tuple, List, Optional
 import urllib.parse
 import html as _html
+
+try:
+    import requests
+except Exception:
+    requests = None
 
 try:
     from webarchive import WebArchive
@@ -43,6 +48,7 @@ RESERVED_NAMES = {
     *(f"LPT{i}" for i in range(1, 10))
 }
 MIN_WEBARCHIVE_SIZE = 128
+FETCH_TIMEOUT = 10  # seconds for network fetch of missing resources
 # ============================
 
 
@@ -78,10 +84,6 @@ def ensure_parent(path: Path, dry_run: bool = False):
 
 
 def add_long_path_prefix(path_input: str) -> str:
-    r"""
-    Return a normalized absolute path string.
-    On Windows, optionally add the \\?\ prefix (and \\?\UNC\ for UNC paths) to support long paths.
-    """
     p = str(path_input)
     p = os.path.abspath(p)
     if os.name != 'nt' or not USE_LONG_PATH_PREFIX:
@@ -103,7 +105,8 @@ def _write_bytes_file(path: str, data: bytes):
         fh.write(data)
 
 
-# ----------------- Helpers to build index / extract resources ----------------- #
+# ---------- Helpers ----------
+
 def _build_index_from_wa(wa, src_name: str) -> str:
     parts = [
         "<!doctype html>",
@@ -113,7 +116,6 @@ def _build_index_from_wa(wa, src_name: str) -> str:
         f"<h1>Index of resources in {src_name}</h1>",
         "<ul>"
     ]
-
     try:
         mr = getattr(wa, "main_resource", None) or getattr(wa, "_main_resource", None)
         if mr:
@@ -122,7 +124,6 @@ def _build_index_from_wa(wa, src_name: str) -> str:
             parts.append(f"<li>Main resource: {name} (mime={mime})</li>")
     except Exception:
         pass
-
     try:
         subs = None
         for attr in ("subresources", "_subresources", "subframe_archives", "subframe"):
@@ -141,7 +142,6 @@ def _build_index_from_wa(wa, src_name: str) -> str:
                 parts.append(f"<li>Resource: {rname} (mime={rmime})</li>")
     except Exception:
         pass
-
     parts.append("</ul></body></html>")
     return "\n".join(parts)
 
@@ -217,23 +217,24 @@ def _guess_html_resource_from_wa(wa) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-# ----------------- Resource extraction + HTML rewrite ----------------- #
-def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, rel_resources_dir: Path) -> str:
-    """
-    Write subresources next to HTML and rewrite HTML to reference local copies.
-    Handles:
-      - <img src>, <img srcset>
-      - CSS url(...)
-      - protocol-relative URLs (//host/...)
-      - absolute and path-only URLs
-      - quoted and URL-encoded occurrences
-    Returns rewritten HTML text.
-    """
+# ----------------- Extraction + rewrite with optional network fetch ----------------- #
+def _attempt_fetch(url: str) -> Optional[bytes]:
+    if requests is None:
+        return None
+    try:
+        resp = requests.get(url, timeout=FETCH_TIMEOUT)
+        if resp.status_code == 200:
+            return resp.content
+    except Exception:
+        return None
+    return None
+
+
+def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, rel_resources_dir: Path, fetch_missing: bool) -> str:
     out_dir = out_html_path.parent
     resources_dir = out_dir / rel_resources_dir
     resources_dir.mkdir(parents=True, exist_ok=True)
 
-    # collect resources from webarchive
     resources = []
     for attr in ("subresources", "_subresources", "resources", "web_resources", "WebResources"):
         if hasattr(wa, attr):
@@ -244,7 +245,6 @@ def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, r
                     break
             except Exception:
                 pass
-    # include main resource too (images sometimes listed there)
     try:
         mr = getattr(wa, "main_resource", None) or getattr(wa, "_main_resource", None)
         if mr:
@@ -252,7 +252,6 @@ def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, r
     except Exception:
         pass
 
-    # helper to probe resource object for url, mime, bytes
     def probe(r):
         orig = None
         for name in ("url", "URL", "path", "filename", "src"):
@@ -264,13 +263,11 @@ def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, r
                         break
                 except Exception:
                     pass
-        # dict-like fallback
         if orig is None and isinstance(r, dict):
             for key in ("url", "URL", "path", "filename", "src"):
                 if key in r and r[key]:
                     orig = str(r[key]); break
 
-        # data bytes
         data = None
         for dname in ("data", "data_bytes", "content", "value", "html"):
             if hasattr(r, dname):
@@ -288,23 +285,20 @@ def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, r
         if isinstance(data, (bytes, bytearray)):
             bytes_data = bytes(data)
         elif isinstance(data, str):
-            # textual resources treated separately; images usually bytes
             try:
                 bytes_data = data.encode("utf-8")
             except Exception:
                 bytes_data = data.encode("latin-1", errors="replace")
-        return orig, bytes_data, getattr(r, "mimeType", None) or getattr(r, "MIMEType", None) or (r.get("mimeType") if isinstance(r, dict) else None)
+        mime = getattr(r, "mimeType", None) or getattr(r, "MIMEType", None) or (r.get("mimeType") if isinstance(r, dict) else None)
+        return orig, bytes_data, mime
 
-    # mapping original reference forms -> local relative path
     url_to_local = {}
 
     for idx, r in enumerate(resources, start=1):
         orig_url, data_bytes, mime = probe(r)
-        # skip empty
         if not data_bytes and not orig_url:
             continue
 
-        # pick filename
         filename = None
         if orig_url:
             parsed = urllib.parse.urlparse(orig_url)
@@ -312,10 +306,8 @@ def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, r
             if candidate:
                 filename = safe_component(candidate)
         if not filename:
-            # fallback to generic
             filename = f"resource_{idx}"
 
-        # determine extension if missing
         if not Path(filename).suffix:
             ext = ""
             if isinstance(mime, str):
@@ -337,14 +329,31 @@ def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, r
             if ext:
                 filename += ext
 
-        # avoid collisions
         local_path = resources_dir / filename
         i = 1
         while local_path.exists():
             local_path = resources_dir / f"{Path(filename).stem}_{i}{Path(filename).suffix}"
             i += 1
 
-        # if we have bytes, write; otherwise skip writing but still map orig URL to a placeholder if needed
+        # If no embedded bytes, optionally fetch
+        if not data_bytes and orig_url and fetch_missing:
+            fetched = None
+            # prefer absolute http/https; if protocol-relative, try https then http
+            if orig_url.startswith("//"):
+                for scheme in ("https:", "http:"):
+                    try:
+                        fetched = _attempt_fetch(scheme + orig_url)
+                        if fetched:
+                            break
+                    except Exception:
+                        fetched = None
+            else:
+                # try the orig_url directly, and if it looks path-only, do not attempt
+                if urllib.parse.urlparse(orig_url).scheme in ("http", "https"):
+                    fetched = _attempt_fetch(orig_url)
+            if fetched:
+                data_bytes = fetched
+
         if data_bytes:
             try:
                 _write_bytes_file(add_long_path_prefix(str(local_path)), data_bytes)
@@ -354,38 +363,30 @@ def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, r
                 except Exception:
                     continue
         else:
-            # nothing embedded; skip unless orig_url exists
             if not orig_url:
                 continue
 
         rel_path = os.path.relpath(local_path, out_dir).replace(os.path.sep, "/")
 
-        # map multiple variants of orig_url so replacement catches many forms
         if orig_url:
             url_to_local[orig_url] = rel_path
-            # protocol-relative
             if orig_url.startswith("//"):
                 url_to_local["http:" + orig_url] = rel_path
                 url_to_local["https:" + orig_url] = rel_path
             parsed = urllib.parse.urlparse(orig_url)
             if parsed.scheme:
-                # full and also path-only
                 url_to_local[urllib.parse.urlunparse(parsed._replace(scheme=""))] = rel_path
                 if parsed.path:
                     url_to_local[parsed.path] = rel_path
             else:
-                # path-only mapping
                 url_to_local[orig_url] = rel_path
-            # encoded form
             try:
                 url_to_local[urllib.parse.quote(orig_url, safe="")] = rel_path
             except Exception:
                 pass
 
-    # If no base tag exists, and we rewrote many relative paths, inject a <base> to ensure local resolution.
     base_match = re.search(r"<base\s+[^>]*href\s*=\s*([\"'])(.*?)\1", html_text, flags=re.I)
     if not base_match:
-        # insert after <head> if present, otherwise at top
         if re.search(r"(?i)<head[^>]*>", html_text):
             html_text = re.sub(r"(?i)(<head[^>]*>)", r"\1\n<base href=\"./\">", html_text, count=1)
         else:
@@ -393,7 +394,6 @@ def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, r
 
     rewritten = html_text
 
-    # Replace srcset entries (comma-separated list of URLs with optional descriptors)
     def replace_srcset(match):
         val = match.group(1)
         parts = [p.strip() for p in val.split(",")]
@@ -409,12 +409,10 @@ def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, r
     rewritten = re.sub(r'srcset\s*=\s*"([^"]+)"', replace_srcset, rewritten, flags=re.I)
     rewritten = re.sub(r"srcset\s*=\s*'([^']+)'", replace_srcset, rewritten, flags=re.I)
 
-    # Replace common attributes: src, href, poster, data-src etc.
     for attr in ("src", "href", "poster", "data-src", "data-hires"):
         pattern = re.compile(rf'{attr}\s*=\s*([\'"])(.*?)\1', flags=re.I)
         rewritten = pattern.sub(lambda m: f'{attr}={m.group(1)}{(url_to_local.get(m.group(2)) or url_to_local.get(urllib.parse.unquote(m.group(2))) or m.group(2))}{m.group(1)}', rewritten)
 
-    # Replace CSS url(...) occurrences
     def css_url_repl(m):
         inner = m.group(1).strip().strip('\'"')
         local = url_to_local.get(inner) or url_to_local.get(urllib.parse.unquote(inner))
@@ -423,7 +421,6 @@ def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, r
         return m.group(0)
     rewritten = re.sub(r'url\(\s*([^)]+?)\s*\)', css_url_repl, rewritten, flags=re.I)
 
-    # As a last pass, replace any full original URLs we mapped (longer first)
     for orig, local in sorted(url_to_local.items(), key=lambda kv: -len(kv[0])):
         try:
             rewritten = rewritten.replace(orig, local)
@@ -432,17 +429,31 @@ def _extract_subresources_and_rewrite(html_text: str, wa, out_html_path: Path, r
         except Exception:
             pass
 
+    # debug dump
+    try:
+        print(f"    [debug] resources written for: {out_dir}")
+        printed = 0
+        for orig, local in sorted(url_to_local.items(), key=lambda kv: -len(kv[0])):
+            local_fs = (out_dir / local)
+            size = None
+            try:
+                size = local_fs.stat().st_size
+            except Exception:
+                size = None
+            print(f"      {orig} -> {local}  (exists={local_fs.exists()}, size={size})")
+            printed += 1
+            if printed >= 200:
+                print("      [debug] ... truncated list")
+                break
+    except Exception:
+        pass
+
     return rewritten
 
 
-# ----------------- Conversion using pywebarchive 0.5.2 APIs ----------------- #
+# ----------------- Conversion ----------------- #
 def convert_to_html(src_path: Path, html_dest: Path, dry_run: bool = False,
-                    inline_resources: bool = False):
-    """
-    Uses WebArchive.to_html() when available; falls back to extracting main_resource
-    or building an index if no main resource is present.
-    If inline_resources is True, writes subresources locally and rewrites HTML to reference them.
-    """
+                    inline_resources: bool = False, fetch_missing: bool = False):
     ensure_parent(html_dest, dry_run=dry_run)
     if dry_run:
         return
@@ -454,27 +465,26 @@ def convert_to_html(src_path: Path, html_dest: Path, dry_run: bool = False,
 
     wa = WebArchive(web_src)
 
-    last_exc = None
     if hasattr(wa, "to_html"):
         try:
             html_text = wa.to_html()
             if html_text:
                 if inline_resources:
-                    html_text = _extract_subresources_and_rewrite(html_text, wa, html_dest, Path("resources"))
+                    html_text = _extract_subresources_and_rewrite(html_text, wa, html_dest, Path("resources"), fetch_missing)
                 _write_text_file(web_out, html_text)
                 return
-        except Exception as e:
-            last_exc = e
+        except Exception:
+            pass
 
     try:
         mime, html_text = _guess_html_resource_from_wa(wa)
         if mime and html_text:
             if inline_resources:
-                html_text = _extract_subresources_and_rewrite(html_text, wa, html_dest, Path("resources"))
+                html_text = _extract_subresources_and_rewrite(html_text, wa, html_dest, Path("resources"), fetch_missing)
             _write_text_file(web_out, html_text)
             return
-    except Exception as e:
-        last_exc = e
+    except Exception:
+        pass
 
     try:
         mr = getattr(wa, "main_resource", None) or getattr(wa, "_main_resource", None)
@@ -497,12 +507,12 @@ def convert_to_html(src_path: Path, html_dest: Path, dry_run: bool = False,
                         text = None
                 if text:
                     if inline_resources:
-                        text = _extract_subresources_and_rewrite(text, wa, html_dest, Path("resources"))
+                        text = _extract_subresources_and_rewrite(text, wa, html_dest, Path("resources"), fetch_missing)
                     _write_text_file(web_out, text)
                     return
             if isinstance(data, str):
                 if inline_resources:
-                    data = _extract_subresources_and_rewrite(data, wa, html_dest, Path("resources"))
+                    data = _extract_subresources_and_rewrite(data, wa, html_dest, Path("resources"), fetch_missing)
                 _write_text_file(web_out, data)
                 return
     except Exception:
@@ -513,12 +523,8 @@ def convert_to_html(src_path: Path, html_dest: Path, dry_run: bool = False,
     return
 
 
-# ----------------- PDF filename sanitization and html->pdf ----------------- #
+# ----------------- PDF handling (sanitized name + atomic write) ----------------- #
 def safe_pdf_filename(orig_name: str, max_stem: int = 180) -> str:
-    """
-    Normalize and sanitize a filename for Windows PDF output.
-    Returns a filename including the .pdf extension.
-    """
     name = unicodedata.normalize("NFKC", orig_name)
     stem = str(PurePath(name).stem)
     stem = INVALID_CHARS_RE.sub("_", stem)
@@ -533,33 +539,23 @@ def safe_pdf_filename(orig_name: str, max_stem: int = 180) -> str:
 
 
 def html_to_pdf(html_path: Path, pdf_dest: Path, wkhtml_path: Path, dry_run: bool = False):
-    """
-    Convert HTML to PDF using wkhtmltopdf with tolerant flags.
-    Writes to a temporary file next to the destination and then moves it into place.
-    Ensures parent directories exist and sanitizes output filename.
-    """
     if dry_run:
         return
-
     wk = str(wkhtml_path) if wkhtml_path else None
     if not wk or not os.path.isfile(wk):
         raise FileNotFoundError("wkhtmltopdf not configured or not found at: " + str(wkhtml_path))
 
-    # Ensure destination directory exists
     pdf_dest_parent = pdf_dest.parent
     pdf_dest_parent.mkdir(parents=True, exist_ok=True)
 
-    # Sanitize destination filename
     sanitized = safe_pdf_filename(pdf_dest.name)
     final_pdf_path = pdf_dest_parent / sanitized
 
-    # Use a temporary file in same directory to allow atomic move
     tmp_fd, tmp_path = tempfile.mkstemp(prefix="wkpdf_", suffix=".pdf", dir=str(pdf_dest_parent))
     os.close(tmp_fd)
     tmp_path_noprefix = os.path.abspath(tmp_path)
     dst_path_noprefix = os.path.abspath(str(final_pdf_path))
 
-    # Build file:// URL for input (no \\?\ prefix)
     src_path_noprefix = os.path.abspath(str(html_path))
     drive, _ = os.path.splitdrive(src_path_noprefix)
     if drive:
@@ -580,14 +576,12 @@ def html_to_pdf(html_path: Path, pdf_dest: Path, wkhtml_path: Path, dry_run: boo
     ]
 
     try:
-        completed = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        # Move temp into final place (overwrite if exists)
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             if os.path.exists(dst_path_noprefix):
                 os.remove(dst_path_noprefix)
             os.replace(tmp_path_noprefix, dst_path_noprefix)
         except Exception as me:
-            # cleanup temp file on move failure
             try:
                 if os.path.exists(tmp_path_noprefix):
                     os.remove(tmp_path_noprefix)
@@ -595,7 +589,6 @@ def html_to_pdf(html_path: Path, pdf_dest: Path, wkhtml_path: Path, dry_run: boo
                 pass
             raise RuntimeError(f"wkhtmltopdf wrote temp PDF but moving to final location failed: {me}")
     except subprocess.CalledProcessError as e:
-        # cleanup temp file on failure
         try:
             if os.path.exists(tmp_path_noprefix):
                 os.remove(tmp_path_noprefix)
@@ -612,32 +605,7 @@ def html_to_pdf(html_path: Path, pdf_dest: Path, wkhtml_path: Path, dry_run: boo
         raise
 
 
-def move_failed(src_file: Path, failed_root: Path, rel_root: Path, dry_run: bool = False):
-    dest = failed_root / rel_root / src_file.name
-    if dry_run:
-        print(f"    [dry-run] would move {src_file} -> {dest}")
-        return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    s = add_long_path_prefix(str(src_file))
-    d = add_long_path_prefix(str(dest))
-    try:
-        shutil.move(s, d)
-    except Exception:
-        try:
-            shutil.copy2(s, d)
-            os.remove(s)
-        except Exception as e2:
-            raise RuntimeError(f"Failed to move or copy failed file {src_file}: {e2}") from e2
-
-
-def truncate_rel_parts(rel: Path) -> Path:
-    parts = []
-    for part in rel.parts:
-        parts.append(safe_component(part, MAX_COMPONENT_LEN))
-    return Path(*parts) if parts else Path("")
-
-
-# ---------- Validation helpers ----------
+# ---------- Validation and file discovery ----------
 
 def is_likely_webarchive_file(path: Path, min_size: int = MIN_WEBARCHIVE_SIZE) -> bool:
     if path.name.startswith("._"):
@@ -662,27 +630,20 @@ def is_likely_webarchive_file(path: Path, min_size: int = MIN_WEBARCHIVE_SIZE) -
 
 
 def is_valid_webarchive_by_parsing(path: Path, dry_run: bool = False) -> Tuple[bool, str]:
-    """
-    Definitive parsing validation using pywebarchive.
-    Creates a temp file with mkstemp then closes descriptor so Windows won't block it.
-    """
     if WebArchive is None:
         return False, "pywebarchive not installed"
     if dry_run:
         return True, "dry-run: parsing skipped"
-
     try:
         wa = WebArchive(add_long_path_prefix(str(path)))
     except Exception as e:
         return False, f"pywebarchive init failed: {e}"
-
     fd = None
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(prefix="wa_check_", suffix=".html")
         os.close(fd)
         tmp_out = add_long_path_prefix(tmp_path)
-
         try:
             if hasattr(wa, "to_html"):
                 try:
@@ -694,7 +655,6 @@ def is_valid_webarchive_by_parsing(path: Path, dry_run: bool = False) -> Tuple[b
                     pass
         except Exception:
             pass
-
         try:
             mr = getattr(wa, "main_resource", None) or getattr(wa, "_main_resource", None)
             if mr:
@@ -722,14 +682,12 @@ def is_valid_webarchive_by_parsing(path: Path, dry_run: bool = False) -> Tuple[b
                     return True, ""
         except Exception:
             pass
-
         try:
             idx = _build_index_from_wa(wa, path.name)
             _write_text_file(tmp_out, idx)
             return True, ""
         except Exception as e:
             return False, f"fallback index generation failed: {e}"
-
     except Exception as e:
         return False, f"temp file error: {e}"
     finally:
@@ -739,8 +697,6 @@ def is_valid_webarchive_by_parsing(path: Path, dry_run: bool = False) -> Tuple[b
         except Exception:
             pass
 
-
-# ---------- File discovery and processing ----------
 
 def gather_webarchive_files(src_root: Path) -> List[Path]:
     files: List[Path] = []
@@ -769,10 +725,35 @@ def clean_sidecars_to_failed(src_root: Path, failed_root: Path, dry_run: bool = 
     return moved
 
 
+def move_failed(src_file: Path, failed_root: Path, rel_root: Path, dry_run: bool = False):
+    dest = failed_root / rel_root / src_file.name
+    if dry_run:
+        print(f"    [dry-run] would move {src_file} -> {dest}")
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    s = add_long_path_prefix(str(src_file))
+    d = add_long_path_prefix(str(dest))
+    try:
+        shutil.move(s, d)
+    except Exception:
+        try:
+            shutil.copy2(s, d)
+            os.remove(s)
+        except Exception as e2:
+            raise RuntimeError(f"Failed to move or copy failed file {src_file}: {e2}") from e2
+
+
+def truncate_rel_parts(rel: Path) -> Path:
+    parts = []
+    for part in rel.parts:
+        parts.append(safe_component(part, MAX_COMPONENT_LEN))
+    return Path(*parts) if parts else Path("")
+
+
 def process_single_file(src_file: Path, out_html_root: Path, out_pdf_root: Path,
                         failed_root: Path, wkhtml_path: Path,
                         skip_pdf: bool, dry_run: bool, validate: bool,
-                        inline_resources: bool) -> Tuple[bool, str]:
+                        inline_resources: bool, fetch_missing: bool) -> Tuple[bool, str]:
     try:
         if not src_file.exists():
             return False, "source file not found"
@@ -785,9 +766,8 @@ def process_single_file(src_file: Path, out_html_root: Path, out_pdf_root: Path,
         rel_root = Path(".")
         safe_stem, _ = safe_stem_with_ext(src_file.name)
         out_html = out_html_root / rel_root / (safe_stem + ".html")
-        # keep pdf_dest path but html_to_pdf will sanitize filename before writing
         out_pdf = out_pdf_root / rel_root / (safe_stem + ".pdf")
-        convert_to_html(src_file, out_html, dry_run=dry_run, inline_resources=inline_resources)
+        convert_to_html(src_file, out_html, dry_run=dry_run, inline_resources=inline_resources, fetch_missing=fetch_missing)
         if (not skip_pdf) and wkhtml_path:
             attempts = 3
             last_err = None
@@ -813,7 +793,7 @@ def process_single_file(src_file: Path, out_html_root: Path, out_pdf_root: Path,
 def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
                      failed_root: Path, wkhtml_path: Path,
                      skip_pdf: bool, dry_run: bool, use_progress: bool, validate: bool,
-                     clean_sidecars: bool, inline_resources: bool):
+                     clean_sidecars: bool, inline_resources: bool, fetch_missing: bool):
     if not src_root.exists():
         print("Source folder not found:", src_root)
         return
@@ -884,7 +864,7 @@ def walk_and_process(src_root: Path, out_html_root: Path, out_pdf_root: Path,
                         print(f"    Failed to move invalid file {src_file}: {me}")
                     continue
 
-            convert_to_html(src_file, out_html, dry_run=dry_run, inline_resources=inline_resources)
+            convert_to_html(src_file, out_html, dry_run=dry_run, inline_resources=inline_resources, fetch_missing=fetch_missing)
             if not dry_run:
                 print(f"    HTML -> {out_html}")
             if (not skip_pdf) and wkhtml_path:
@@ -941,6 +921,7 @@ def parse_args():
     p.add_argument("--validate", action="store_true", help="Enable parsing validation with pywebarchive (slower)")
     p.add_argument("--clean-sidecars", action="store_true", help="Move AppleDouble sidecar files (._*.webarchive) to FAILED before processing")
     p.add_argument("--inline-resources", action="store_true", help="Write subresources locally and rewrite HTML to reference them (produces fully offline HTML for PDF)")
+    p.add_argument("--fetch-missing", action="store_true", help="Attempt to download missing subresources from original URLs when archive lacks embedded bytes (requires requests)")
     return p.parse_args()
 
 
@@ -959,7 +940,8 @@ def main():
             skip_pdf=args.skip_pdf,
             dry_run=args.dry_run,
             validate=args.validate,
-            inline_resources=args.inline_resources
+            inline_resources=args.inline_resources,
+            fetch_missing=args.fetch_missing
         )
         if success:
             print("Test conversion succeeded:", message)
@@ -980,7 +962,8 @@ def main():
             use_progress=use_progress,
             validate=args.validate,
             clean_sidecars=args.clean_sidecars,
-            inline_resources=args.inline_resources
+            inline_resources=args.inline_resources,
+            fetch_missing=args.fetch_missing
         )
         return 0
     except Exception as e:
